@@ -6,12 +6,14 @@ from IPython.display import clear_output
 
 import pickle
 import gzip
-import re
 
 # Data manipulation dependencies
-import pandas as pd
+#import pandas as pd
 import numpy as np
 import datetime as dt
+from collections import OrderedDict
+import scipy
+import statistics
 
 # System data locs
 source_dir = '/oasis/projects/nsf/sys200/stats/xsede_stats/'
@@ -29,10 +31,137 @@ curr_data = [ locs['arc']+'/'+host_dir+'/'+stamp
 aofa_data = [ locs['aofa']+'/'+host_dir+'/'+stamp 
             for host_dir in listdir(locs['aofa'])
             for stamp in listdir(locs['aofa']+'/'+host_dir)  ]
+
 arc_data = curr_data + aofa_data
 
-### Prep Cleaning
+## Handle minor formatting for search methods
+GPU_host_key = 'comet-3'
+GPU_exceptions = [ 'comet-30-01', 'comet-30-02', 'comet-31-01', 'comet-31-02' ]
+sorted_arc_data = OrderedDict()
 
+for i in range(len( arc_data )):
+    host_x = arc_data[i].find("comet")
+    host_name = arc_data[i][ host_x : host_x + 11 ]
+    
+    if ( GPU_host_key not in host_name ) or ( host_name in GPU_exceptions ):
+        if host_name in sorted_arc_data:
+            sorted_arc_data[ host_name ].append( arc_data[i] )
+        
+        else:
+            sorted_arc_data[ host_name ] = [ arc_data[i] ]
+
+### Prep Analysis
+def check_static( alist ):
+    return alist[1:] == alist[:-1]
+
+def fresh_start( host_data_list ):
+    return ( all(i < j for i, j in zip(host_data_list, host_data_list[1:]) ))
+
+def monotonic( nice_list ):
+    dx = np.diff( nice_list )
+    return np.all(dx <= 0) or np.all(dx >= 0)
+
+def get_stats( data ):   
+    try:
+        stats_blob = {
+            'Count' : len(data),
+            'Min' : min(data),
+            'Max' : max(data),
+            'Mode' : statistics.mode(data),
+            'Quartiles' : np.percentile(data, [25, 50, 75] ),
+            'Mean' : np.mean(data),
+            'Std. Dev' : np.std(data),
+            'Skew' : scipy.stats.skew(data),
+            'Values': data
+        }
+        return stats_blob
+    
+    except:
+        stats_blob = {
+            'Count' : len(data),
+            'Min' : min(data),
+            'Max' : max(data),
+            'Quartiles' : np.percentile(data, [25, 50, 75] ),
+            'Mean' : np.mean(data),
+            'Std. Dev' : np.std(data),
+            'Skew' : scipy.stats.skew(data),
+            'Values': data
+        }
+        return stats_blob
+    
+def get_cov_matrix( x_list, y_list ):
+    x_arr,y_arr = np.array( x_list ), np.array( y_list )
+    
+    return np.cov( x_arr, y_arr )
+
+def get_corr_matrix( x_list, y_list ):
+    x_arr,y_arr = np.array( x_list ), np.array( y_list )
+    
+    return np.corrcoef( x_arr, y_arr ) #r = corrcoef_matrix[0, 1]
+
+def corr_w_pval( x_list, y_list ):
+    x_arr,y_arr = np.array( x_list ), np.array( y_list )
+
+    return scipy.stats.pearsonr( x_arr, y_arr )
+
+def linear_reg( x_list, y_list ):
+    x_arr,y_arr = np.array( x_list ), np.array( y_list )
+
+    #LinregressResult has .slope, .intercept, .rvalue, .pvalue, .stderr
+    return scipy.stats.linregress( x_arr, y_arr )
+
+def norm_df( df ):
+    return (df-df.mean())/df.std()
+
+def minmax_df( df ):
+    return (df-df.min())/(df.max()-df.min())
+
+def get_sample_hosts( search_set, n ):
+    out = []
+    
+    for i in range(n):
+        idx = np.random.randint( len(search_set) )
+        val = search_set[ idx ]
+        
+        if '_' not in val[3]:
+            out.append( val )
+        else:
+            idx = np.random.randint( len(search_set) )
+            val = search_set[ idx ]
+            out.append( val )
+        
+    return out
+
+def get_host_descriptives( labeled_data_dict, data_keys_list ):
+    descriptives = { "Static":[] }
+    
+    for i in range(len( data_keys_list )):
+        key = data_keys_list[i]
+        timedata_list = [ float(item[1]) for item in labeled_data_dict[ key ] ]
+        
+        if ( sum(timedata_list) == 0 ) or ( check_static( timedata_list ) ):
+            descriptives["Static"].append( key )
+            
+        else:
+            
+            if not fresh_start( timedata_list ):
+                temp = timedata_list
+                base = temp[0]
+                timedata_list = [ x - base for x in temp ]
+        
+                stats = get_stats( timedata_list )
+                stats["Nonzero Start"] = True
+                stats["Starting Value"] = base
+                stats["Raw Values"] = temp
+                descriptives[ key ] = stats
+                
+            else:
+                stats = get_stats( timedata_list )
+                descriptives[ key ] = stats
+                
+    return descriptives
+
+### Prep Cleaning
 def get_time( spec=None ):
     if type(spec) is str:
         try:
@@ -71,25 +200,26 @@ def comp_window( t_0, t_n, t_x ):
     except:
         return -1            
 
-def check_static( alist ):
-    return alist[1:] == alist[:-1]
-
 def check_header( line ):
-    if line.find(" ") < 0:
-        try:
-            return line[0] == '%'
-        except:
-            return False
-        
-    else:
-        chunks = line.split(" ")
-        try:
-            return (chunks[0][0] == '%') or ( chunks[2].find("comet") >= 0 )
-        except:
-            return False
+    try: return (line.split(" ")[0] not in ['$','!','%begin','%end']) and ('comet' in line.split(" ")[2])
+    except: return False
 
 def check_job( chunk ):
     return chunk.find("-") == -1
+
+def check_host_file( headers_list, search_tup ):
+    ids = [ item.split(" ")[1] for item in headers_list ]
+    target_id = search_tup[3]
+    
+    if (target_id in ids) and (ids[1:] == ids[:-1]):
+        return 2
+    elif (target_id in ids):
+        return 1
+    else:
+        return 0
+
+def get_year( gz_filename ):
+    return get_time( gz_filename.split("/")[-1][:-3])[:4]    
 
 def open_txt( txt_file ):
     with open( txt_file, "rt" ) as f:
@@ -104,6 +234,65 @@ def unzip_txt( gzipped ):
         f.close()
     
     return lines
+
+def try_acct_file( test_date, jobid ):
+    try:
+        base = '/oasis/projects/nsf/sys200/stats/xsede_stats/comet_accounting/'
+        end_date = str( test_date )
+        jobid = str( jobid )
+        
+        test_file = base + end_date + '.txt'
+        test_acct_info = [ line for line in open_txt( test_file ) if jobid in line ]
+        
+        return test_acct_info
+    
+    except:
+        return []
+    
+def buffer_try_acct_file( a_search_tup, anon=True ):
+    test_end_date = a_search_tup[2][:10]
+    test_jobid = a_search_tup[3]
+    test_ret = try_acct_file( test_end_date, test_jobid )
+    anon_filter = ['User', 'Account', 'JobName']
+    
+    try:
+        if (test_ret) and (not anon):
+            acct_rules = 'JobID|User|Account|Start|End|Submit|Partition|Timelimit|JobName|State|NNodes|ReqCPUS|NodeList\n'.split('|')
+            acct_data = test_ret[0].split('|')
+            paired = { acct_rules[i] : acct_data[i] for i in range(len(acct_rules)) }
+        
+            return paired
+        
+        elif (test_ret) and anon:
+            acct_rules = 'JobID|User|Account|Start|End|Submit|Partition|Timelimit|JobName|State|NNodes|ReqCPUS|NodeList\n'.split('|')
+            acct_data = test_ret[0].split('|')
+            paired = { acct_rules[i] : acct_data[i] for i in range(len(acct_rules)) if acct_rules[i] not in anon_filter }
+        
+            return paired            
+    
+    except:
+        return test_ret
+
+def fill_acct_info( partial_info, info_keys ):
+    filled = { item:{} for item in info_keys }
+    base = partial_info["Out"]
+    
+    for item in info_keys:
+        base_item = base[ item ]
+        filled[ item ] = buffer_try_acct_file( item )
+        filled[ item ].update( base_item  )            
+    
+    return filled    
+
+## Used in deep_search_host() to buffer bad files
+def try_open_x( aList, x ):
+    try:
+        unzip_txt( aList[x] )
+        return ( aList[x], x )
+    
+    except:
+        x += 1
+        try_open_x( aList, x )
 
 def group_from_txt( txt_file ):
     lines = open_txt( txt_file )
@@ -155,9 +344,19 @@ def collect_failed( acct_file, lim=False ):
     
     return test_ids
 
+def failed_search( collected_dict_list ):
+    
+    for i in range( collected_dict_list ):
+        temp = collected_dict_list[i]
+        nodelist = temp['NodeList']
+        s = temp['Start']
+        e = temp['End']
+        jobid = temp['JobID']
+
 def collect_headers( host_gzfile ):
     lines = unzip_txt( host_gzfile )
-    return [ line for line in lines if 'comet' in line and ' ' in line ]
+    ret_list = [ line for line in lines if 'comet' in line and ' ' in line ]
+    return ret_list[1:]
 
 def quick_save( obj, label=get_time() ):
     
@@ -165,29 +364,10 @@ def quick_save( obj, label=get_time() ):
         out_file = open( label, 'wb')
         pickle.dump( obj, out_file)
         
-        # double check save
-        check_cpicore_set = pickle.load(open(cpiset_out, 'rb'))
-        check_cpicore_set = None
-        
     except:
         "There was a problem pickling the object - Save manually."
 
 ####Formatting
-
-def format_header( line ):
-    chunks = line.split(" ")
-    
-    try:
-        if chunks[0][0] == '%':
-            return {}
-        else:
-            return { "Timestamp": get_time( chunks[0] ), 
-                     "Jobid": chunks[1],
-                     "Host": chunks[2][:11] }
-        
-    except:
-        return {}
-
 def format_nodelist( nodelist ):
     purged = nodelist.replace('[','').replace(']','').replace(',','-').replace('-','').split("comet")[1:]
     nodes = []
@@ -205,15 +385,6 @@ def format_nodelist( nodelist ):
 
 def format_spec( line ):
     return line[1:-1]
-
-def format_data( line ):
-    chunks = line.split(" ")
-    
-    stat = chunks[0]
-    dev = chunks[1]
-    data = chunks[2:-1]
-    
-    return { (stat,dev): data }
 
 def format_schema( line ):
     chunks = line.partition(" ")
@@ -233,6 +404,25 @@ def format_schema( line ):
     
     return { stat:fin_sch }
 
+def format_header( line ):
+    chunks = line.split(" ")
+    
+    try:
+        return { "Timestamp": chunks[0], 
+                     "Jobid": chunks[1],
+                     "Host": chunks[2][:11] }
+    except:
+        return line
+    
+def format_data( line ):
+    chunks = line.split(" ")
+    
+    stat = chunks[0]
+    dev = chunks[1]
+    data = chunks[2:-1]
+    
+    return { (stat,dev): data }
+
 def separate_nodes( search_tup ):
     nl = search_tup[0]
     t_0 = search_tup[1]
@@ -251,7 +441,23 @@ def separate_nodes( search_tup ):
             exp_list.append( (node,t_0,t_n) )
     
     return exp_list
+
+def labeled_data( data_list ):
+    out_dict = {}
     
+    for i in range( len( data_list )):
+        line = data_list[i]
+        label = line[:3]
+        val = line[3]
+        t = line[4]
+        
+        if label in out_dict:
+            out_dict[label].append( ( t, val ) )
+        else:
+            out_dict[label] = [( t, val )]
+    
+    return out_dict
+
 def from_list( chunks ):
     nl_i = chunks.index("comet")
     nl = chunks[ nl_i ]
@@ -322,39 +528,87 @@ def format_search_tup( line ):
     else:
         return 1
 
+def acct_file_to_searchset( acct_chunks=False, partial_txt=False, full_txt=False ):
+    out_list = []
+    
+    if acct_chunks:
+        chunks = acct_chunks
+    
+    elif partial_txt:
+        raw_chunks = open_txt( partial_txt )
+        chunks = [ item for item in raw_chunks ]
+    
+    elif full_txt:
+        chunks = open_txt( full_txt )[1:]
+    
+    else:
+        return 1
+        
+    for i in range(len( chunks )):
+        curr = chunks[i].split("|")
+        jobid = curr[0]
+        s = curr[3]
+        e = curr[4]
+        
+        # actual reported host node(s)
+        if "comet" in curr[-1]:
+            
+            if '\n' in curr[-1] or '\\n' in curr[-1]:
+                check = curr[-1]
+                checked = check.replace('\n','').replace('\\n','')
+            else:
+                checked = curr[-1]
+                
+            nodelist = format_nodelist( checked )
+            obj_tup = ( nodelist, s, e, jobid )
+            
+            if len( obj_tup[0] ) > 1:
+                exp_tups = separate_nodes( obj_tup )
+                out_list += exp_tups
+                    
+            elif len( obj_tup[0] ) == 1:
+                out_list.append( ( obj_tup[0][0], obj_tup[1], obj_tup[2], obj_tup[3] ) )
+    
+    return out_list
+    
 ####Data analysis
 
-def timely_dict( host_data, host_name ):
-    stamps = list(host_data[ host_name ].keys())
-    schemas = host_data[ host_name ][ stamps[0] ]["Schemas"]
+def timely_dict( info_dict ):
     timely_data = []
     
-    for stamp in stamps:
-        for key,data in host_data[ host_name ][ stamp ]["Data"].items():
-            
+    for header,stat_dict in info_dict["Data"].items():
+        chunks = header.split(" ")
+        t = chunks[0]
+        jobid = chunks[1]
+        
+        for key,data in stat_dict.items():
             stat = key[0]
             dev = key[1]
             
             for i in range(len(data)):
-                metric = schemas[stat][i]
-            
-            info = (stat, metric, dev, int(data[i]), stamp)
-            timely_data.append( info )
-    
-    for i in range(len(timely_data)):
-        datum_list = [ timely_data[i] ]
-        t_i = timely_data[i][4]
-        job_info = host_data[ host_name ][ t_i ]["Job"]
-        
-        try:
-            if "Jobid" in job_info.keys():
-                jobid = (job_info["Jobid"])
-                new_tup = tuple( datum_list.append( jobid ) )
-                timely_data[i] = new_tup
-        except:
-            continue
+                metric = info_dict['Schemas'][stat][i]
+                timely_data.append( (stat, dev, metric, data[i], t, jobid) )
     
     return timely_data
+
+# Search a returned list of data for jobids
+def filter_for_id( raw, t_id ):
+    saved = []
+    
+    for i in range( len( raw )):
+        line = raw[i]
+        
+        try:
+            if int(line[5]) == int(t_id):
+                saved.append( line )
+        except:
+            try:
+                if str(line[5]) == str(t_id):
+                    saved.append( line )
+            except:
+                pass
+                
+    return saved
 
 ####Data Munging
 
@@ -374,52 +628,6 @@ def info_dict( rules, info ):
             info_list = saved.append( cut )
             
         return { rules_list[i]:info_list[i] for i in range(len(rules_list)) }
-
-def host_to_info_dict( zip_txt ):
-    contents = unzip_txt( zip_txt )
-    host_name = contents[1].partition(" ")[2][:11]
-    out_dict = { host_name: {} }
-    host_info = {}
-    info_dict = { "Data":{},
-                    "Job":"N/A",
-                    "Schemas":{},
-                    "Specs":[]
-                }
-    
-    for line in contents:
-            
-        if line[0] == "$":
-            info_dict["Specs"].append( format_spec( line ) )
-            
-        elif line[0] == "!":
-            info_dict["Schemas"].update( format_schema( line ) )
-        
-        else:
-            
-            if (len(line) > 0) and (len(line) < 3 or check_header( line )):
-                header_dict = format_header( line )
-                
-                if header_dict:
-                    t = header_dict["Timestamp"]
-                    host_info[ t ] = {}
-                    
-                    # Collecting as dictionary to support additional accounting data
-                    if check_job( header_dict["Jobid"] ):
-                        temp_jobid = header_dict["Jobid"]
-                        info_dict["Job"] = { "Jobid": temp_jobid } 
-                    
-            else:
-                incoming = format_data( line )
-                info_dict["Data"].update( incoming )
-                
-                host_info[t].update( info_dict )
-                
-    out_dict[host_name].update( host_info )
-    
-    for host_name,host_data in out_dict.items():
-        out_dict[ host_name ][ "Timely Data" ] = timely_dict( out_dict, host_name )
-    
-    return out_dict
 
 def job_to_info_dict( txt_file_list, target=False ):
     nodes_by_date = {}
@@ -463,7 +671,120 @@ def job_to_info_dict( txt_file_list, target=False ):
             continue
             
     
-    return nodes_by_date, unsaved
+    return nodes_by_date, unsaved    
+    
+def host_to_info_dict( zip_txt, jobid=0 ):
+    l = zip_txt.find("comet")
+    r = zip_txt.rfind("comet")
+    
+    if l != r:
+        return zip_txt
+    
+    contents = unzip_txt( zip_txt )
+    info_dict = { 
+        "Schemas":{},
+        "Specs":[],
+        "Data":{},
+        "Jobid(s)":[]
+                }
+    
+    # Collect setting content
+    for i in range(len( contents )):
+        line = contents[ i ]
+        
+        # Spec line
+        if line[0] == "$":
+            info_dict["Specs"].append( format_spec( line ) )
+        
+        # Schema line    
+        if line[0] == "!":
+            info_dict["Schemas"].update( format_schema( line ) )
+    
+    # Collect variable content
+    curr_header = ''
+    
+    for j in range( len(contents) ):
+        line = contents[ j ]
+        
+        if "%" in line.split(" ")[0]:
+            next
+        
+        # Header line
+        elif check_header( line ):
+            header_dict = format_header( line )
+            curr_header = line[:-1]
+                                        
+            if "Timestamp" in header_dict:
+                info_dict["Data"][ curr_header ] = {}
+                    
+                if ("Jobid" in header_dict) and (header_dict["Jobid"] not in info_dict["Jobid(s)"]):
+                    info_dict["Jobid(s)"].append( header_dict["Jobid"] )
+    
+        # Data line
+        else:
+            try:
+                curr_data = format_data( line )
+                info_dict["Data"][curr_header].update( curr_data )
+                    
+            except:
+                next
+                
+    data_dict = timely_dict( info_dict )
+    info_dict["Data"] = data_dict
+    
+    if jobid != 0:
+        try:
+            temp = info_dict["Data"]
+            info_dict["Data"] = filter_for_id( temp, jobid )
+        except:
+            pass
+        
+    return info_dict
+
+def buffer_multi_hosts( source_dict, jobid=0 ):
+    if source_dict["Source"]:
+        src_list = source_dict["Source"]
+        
+        if jobid != 0:
+            base_info = host_to_info_dict( src_list[0], jobid )
+        else:
+            base_info = host_to_info_dict( src_list[0] )
+        
+        if len( src_list ) == 1:
+            base_info.update( source_dict )
+            return base_info
+    
+        else:
+            all_data = []
+            all_ids = []
+    
+            for i in range(len( src_list )):
+                src_file = src_list[i]
+                
+                if jobid != 0:
+                    temp_info = host_to_info_dict( src_file, jobid )
+                else:
+                    temp_info = host_to_info_dict( src_file )
+                
+                data = temp_info["Data"]
+                ids = temp_info["Jobid(s)"]
+                
+                for j in range(len( data )):
+                    val = data[j]
+                    all_data.append( val )
+                    
+                for j in range(len( ids )):
+                    val = ids[j]
+                    all_ids.append( val ) 
+
+            out = {}
+            out.update( source_dict )
+            out["Schemas"] = base_info["Schemas"]
+            out["Specs"] = base_info["Specs"]
+            out["Data"] = all_data
+            out["Jobid(s)"] = all_ids
+            
+            return out
 
 def lookup_files( searchable_list ):
     found = []
@@ -508,59 +829,121 @@ def lookup_files( searchable_list ):
     
     return found,lost
 
+def file_to_list( txt_file ):
+    form_out = []
+    
+    with open( txt_file, "rt" ) as f:
+        lines = f.read()
+    f.close()
+    
+    list_items = [ item.replace('\n','').split(" ") for item in lines.split("\n\n") ]
+    
+    for i in range(len( list_items )):
+        check = list_items[i]
+
+        if len(check) >= 13:
+            nodelist = format_nodelist( check[9].partition("=")[2] )
+                
+            s = check[7].partition("=")[2]
+            e = check[8].partition("=")[2]
+            jobid = check[0].partition("=")[2]
+            
+            this_search_tup = ( nodelist, s, e, jobid )
+            
+            if len(nodelist) == 1:
+                form_out.append( ( nodelist[0], s, e, jobid ) )
+                
+            else:
+                exp_tups = separate_nodes( this_search_tup )
+                form_out += exp_tups
+            
+        
+    return form_out
+
 def deep_search_acct( file_list, search_list ):
     jobids = [ item[3] for item in search_list ]
-    collected = []
+    collected = {}
+    
+    #optional: predict filename using basename+namingrule
     
     for i in range(len(file_list)):
         try:
             possible = open_txt( file_list[i] )
             
-            for jobid in jobids:
+            for j in range(len( jobids )):
+                jobid = jobids[j]
+                
                 for chunk in possible:
                     if jobid in chunk:
-                        collected.append(chunk)
+                        collected[ search_list[j] ] = { "Data": chunk, "Source": file_list[i] }
         except:
             continue
     
     return collected
 
-def deep_search_host( search_list ):
-    out = { item:0 for item in search_list }
+def deep_search_host( search_list, jobids=False ):
+    out = { item:{"Source":[] } for item in search_list }
+    curr_year = get_time()[:4]
     
-    for i in range(len( arc_data )):
-        for j in range(len( search_list )):
-            filename = arc_data[i]
-            target = search_list[j]
+    for i in range(len( search_list )):
+        target = search_list[ i ]#.split(" ")
+        target_host = target[0]
+        target_s = target[1]
+        target_e = target[2]
+        target_y = target_e[:4]
+        
+        if target_host not in sorted_arc_data:
+            out[ target ]["Source"].append( "HostNotFound" )
+        
+        else:
+            host_file_list = sorted_arc_data[ target_host ]
             
-            if target[0] in filename:
-                try:
-                    if comp_window( target[1], target[2], filename[-13:-3] ):
-                        out[ target ] = filename
-                    else:
-                        headers = collect_headers( filename )
-                        out[ target ] = { "Source":[], "Headers":[] }
-                        
-                        for k in range(len( headers )):
-                            sample = headers[k].split(" ")
-                            
-                            # if jobids match
-                            if sample[1] == target[3]:
-                                
-                                if filename not in out[ target ][ "Source" ]:
-                                    out[ target ][ "Source" ].append( filename )
-                                out[ target ]["Headers"].append(sample)
-                            
-                            # if timestamps match
-                            elif comp_window( target[1], target[2], sample[0] ) == 0:
-                                
-                                if filename not in out[ target ][ "Source" ]:
-                                    out[ target ][ "Source" ].append( filename )
-                                out[ target ]["Headers"].append(sample)
-                            
-                except:   
-                    continue
+            if curr_year == target_y:
+                host_file_list.reverse()
+            
+            for j in range( len( host_file_list ) ):
+                filename,x = try_open_x( host_file_list, j )
+                file_year = get_year( filename )
+                j=x
+            
+                # screen for files already added to source collection
+                if ( filename not in out[ target ]["Source"] ) and ( (file_year == target_s[:4] ) or ( file_year == target_e[:4] ) ):
+                    headers = collect_headers( filename ) 
                     
+                    # jobids included in search arguments
+                    if jobids:
+                
+                        # if jobid is only id in file
+                        if check_host_file( headers, target ) == 2 :
+                            out[ target ]["Source"].append( filename )
+                            
+                            if ( "Single JobID" not in out[target] ):
+                                out[ target ]["Single JobID"] = True
+                                                                                        
+                            ####just pull all data from file
+                                
+                        # if jobid is in file but with others
+                        elif check_host_file( headers, target ) == 1:            
+                            out[ target ]["Source"].append( filename )
+                            out[ target ]["Single JobID"] = False
+                                          
+                            #### pull data but key:id, value:lines for id
+                            
+                        # jobid not found
+                        else:
+                            next
+            
+            # jobids not included in search arguments
+            # search by timestamps
+            #else:
+            #    for k in range(len( headers )):
+            #        sample = headers[ k ].split(" ")
+                    
+                    # timestamp in header is between s/e timestamps in target
+            #        if comp_window( target[1], target[2], sample[0] ) == 0:
+                        
+                        ####just pull all data from file
+    
     return out
 
 # PARAMETERS:
@@ -575,12 +958,12 @@ def deep_search_host( search_list ):
 #           search( mode='l', myJobList )
 # 'f' repeated search from nodelist%start%end (from file)
 #       ie) "Text file: your_search_file.txt"  (Note: Mismatched file contents ignored)
-def search( mode=['s/e', 's', 'l','f'], from_list=False, ret_form=False ):
+def search( mode=['s/e', 's', 'l','f'], from_list=False ):
     
     if mode == 's/e':
         t_0,t_n = input("Start, End:").replace(",", "").split(" ")
         start = get_stamp( t_0 )
-        end=get_stamp( t_n )
+        end = get_stamp( t_n )
         return start,end
     
     elif mode == 's':
@@ -606,16 +989,26 @@ def search( mode=['s/e', 's', 'l','f'], from_list=False, ret_form=False ):
             except:
                 try:
                     if ('comet' in obj[0]) and (len(obj[0]) == 11):
-                        out_list.append( obj_tup )
+                        out_list.append( ( obj_tup[0][0], obj_tup[1], obj_tup[2], obj_tup[3] ) )
                 except:
                     continue
                     
         #files,notFound = lookup_files( out_list )
+        acct_info = deep_search_acct( acct_info_locs, out_list )
+        host_info = deep_search_host( out_list, jobids=True )
         
-        #if ret_form:
-            #
-        #else:
-        return { "Acct Info": deep_search_acct( acct_info_locs, out_list ), "Host Info": deep_search_host( out_list ) }
+        # prep output               
+        out_dict = {}
+        
+        for i in range(len( out_list )):
+            label = out_list[i]
+            data_dict = { "Acct Info": acct_info[label]["Data"],
+                          "Host Info": host_info[label]["Data"],
+                          "Source Files": ( acct_info[label]["Source"], host_info[label]["Source"] )
+                        }
+            out_dict[ label ] = data_dict
+                    
+        return out_dict
     
     elif mode == 'f':
         search_list = group_from_text( input("Text file:") )
@@ -623,3 +1016,36 @@ def search( mode=['s/e', 's', 'l','f'], from_list=False, ret_form=False ):
     
     else:
         return 1
+    
+def search_sample_n( search_set, n ):
+    
+    # read in search_out from saved dict in src_file
+    cut = get_sample_hosts( search_set, n)
+    sample_hosts = deep_search_host( cut, jobids=True )
+    
+    # clean up unreturned search results
+    purged = {}
+    for key,val in sample_hosts.items():
+        if val["Source"]:
+            purged[key] = val
+    
+    return { 
+        "Sample": cut,
+        "Raw": sample_hosts,
+        "Out": purged
+    }
+
+def fill_host_info( search_sample ):
+    if search_sample["Out"]:
+        sample_dict = search_sample["Out"]
+        keys = list(sample_dict.keys())
+        sample_out = {}
+        
+        for i in range(len( keys )):
+            key = keys[i]
+            
+            check = sample_dict[ key ]
+            info_dict = buffer_multi_hosts( check, key[3] )
+            sample_out[key] = info_dict
+        
+        return sample_out
